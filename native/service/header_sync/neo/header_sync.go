@@ -18,6 +18,7 @@
 package neo
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"github.com/polynetwork/poly/native"
 	hscommon "github.com/polynetwork/poly/native/service/header_sync/common"
@@ -73,31 +74,75 @@ func (this *NEOHandler) SyncBlockHeader(native *native.NativeService) error {
 	if err := params.Deserialization(common.NewZeroCopySource(native.GetInput())); err != nil {
 		return fmt.Errorf("SyncBlockHeader, contract params deserialize error: %v", err)
 	}
-	neoConsensus, err := getConsensusValByChainId(native, params.ChainID)
+	return processHeadersAndMsg(native, params.ChainID, params.Headers, nil)
+}
+
+func processHeadersAndMsg(native *native.NativeService, chainId uint64, headers [][]byte, msg *NeoCrossChainMsg) error {
+	neoConsensus, err := getConsensusValByChainId(native, chainId)
 	if err != nil {
-		return fmt.Errorf("SyncBlockHeader, the consensus validator has not been initialized, chainId: %d", params.ChainID)
+		return fmt.Errorf("ProcessHeadersAndMsg, the consensus validator has not been initialized, chainId: %d", chainId)
 	}
-	var newNeoConsensus *NeoConsensus
-	for _, v := range params.Headers {
+	msgVerified := false
+	if msg == nil {
+		msgVerified = true
+	}
+	newNeoConsensus := &NeoConsensus{
+		neoConsensus.ChainID,
+		neoConsensus.Height,
+		neoConsensus.NextConsensus,
+	}
+	previousConsensus := &NeoConsensus{
+		neoConsensus.ChainID,
+		neoConsensus.Height,
+		neoConsensus.NextConsensus,
+	}
+	for _, v := range headers {
 		header := new(NeoBlockHeader)
 		if err := header.Deserialization(common.NewZeroCopySource(v)); err != nil {
-			return fmt.Errorf("SyncBlockHeader, NeoBlockHeaderFromBytes error: %v", err)
+			return fmt.Errorf("ProcessHeadersAndMsg, NeoBlockHeaderFromBytes error: %v", err)
 		}
-		if !header.NextConsensus.Equals(neoConsensus.NextConsensus) && header.Index > neoConsensus.Height {
-			if err = verifyHeader(native, params.ChainID, header); err != nil {
-				return fmt.Errorf("SyncBlockHeader, verifyHeader error: %v", err)
+		if !header.NextConsensus.Equals(newNeoConsensus.NextConsensus) && header.Index > newNeoConsensus.Height {
+			if err = verifyHeader(header, newNeoConsensus); err != nil {
+				return fmt.Errorf("ProcessHeadersAndMsg, verifyHeader error: %v", err)
 			}
+			previousConsensus = newNeoConsensus
 			newNeoConsensus = &NeoConsensus{
-				ChainID:       neoConsensus.ChainID,
+				ChainID:       newNeoConsensus.ChainID,
 				Height:        header.Index,
 				NextConsensus: header.NextConsensus,
 			}
 		}
 	}
-	if newNeoConsensus != nil {
+	if newNeoConsensus.Height > neoConsensus.Height {
 		if err = putConsensusValByChainId(native, newNeoConsensus); err != nil {
-			return fmt.Errorf("SyncBlockHeader, update ConsensusPeer error: %v", err)
+			return fmt.Errorf("ProcessHeadersAndMsg, update ConsensusPeer error: %v", err)
 		}
+	}
+	if !msgVerified && msg != nil {
+		if msg.Index < newNeoConsensus.Height {
+			return fmt.Errorf("ProcessHeadersAndMsg, state root in msg is not at current consensus epoch, msg.Index: %d, consensus switch height: %d", msg.Index, newNeoConsensus.Height)
+		}
+		if msg.Index == newNeoConsensus.Height {
+			if err := verifyCrossChainMsg(native, msg, previousConsensus); err != nil {
+				return fmt.Errorf("ProcessHeadersAndMsg, verifyCrossChainMsg error: %v, msg.Index: %d, consensus.Height: %d", err, msg.Index, previousConsensus.Height)
+			}
+			// update the cross chain message hash in order to process other txs in same block
+			msgBs, err := msg.GetMessage()
+			if err != nil {
+				return fmt.Errorf("ProcessHeadersAndMsg, msg.GetMessage() error: %v", err)
+			}
+			if err := putMsgHash(native, chainId, sha256.Sum256(msgBs)); err != nil {
+				return fmt.Errorf("ProcessHeadersAndMsg, putMsgHash error: %v", err)
+			}
+		} else {
+			if err := verifyCrossChainMsg(native, msg, newNeoConsensus); err != nil {
+				return fmt.Errorf("ProcessHeadersAndMsg, verifyCrossChainMsg error: %v, msg.Index: %d, consensus.Height: %d", err, msg.Index, newNeoConsensus.Height)
+			}
+		}
+		msgVerified = true
+	}
+	if !msgVerified {
+		return fmt.Errorf("ProcessHeadersAndMsg, verify cross chain message failed")
 	}
 	return nil
 }

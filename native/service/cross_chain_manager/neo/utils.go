@@ -56,7 +56,5 @@ func VerifyNeoCrossChainProof(proof []byte, stateRoot []byte, contractAddr []byt
 	if err != nil {
 		return nil, fmt.Errorf("VerifyNeoCrossChainProof, joeqian10/neo-gogogo/mpt.VerifyProof error:%v", err)
 	}
-
 	return value, nil
-
 }

@@ -43,7 +43,24 @@ func (this *NEOHandler) MakeDepositProposal(service *native.NativeService) (*sco
 	if err := crossChainMsg.Deserialization(common.NewZeroCopySource(params.HeaderOrCrossChainMsg)); err != nil {
 		return nil, fmt.Errorf("neo MakeDepositProposal, deserialize crossChainMsg error: %v", err)
 	}
-	if err := neo.VerifyCrossChainMsgSig(service, params.SourceChainID, crossChainMsg); err != nil {
+	// Parse Neo headers from params.Extra to 2-d byte array
+	headers := make([][]byte, 0)
+	if len(params.Extra) > 0 {
+		extraSource := common.NewZeroCopySource(params.Extra)
+		extraLen, eof := extraSource.NextVarUint()
+		if eof {
+			return nil, fmt.Errorf("neo MakeDepositProposal, deserialize headers from Extra error")
+		}
+		for i := 0; uint64(i) < extraLen; i++ {
+			headerBs, eof := extraSource.NextVarBytes()
+			if eof {
+				return nil, fmt.Errorf("neo MakeDepositProposal, NextVarBytes for header bytes error")
+			}
+			headers = append(headers, headerBs)
+		}
+	}
+	// Passing headers and Verify crossChainMsg, Neo consensus peers will be updated if headers are valid
+	if err := neo.VerifyCrossChainMsgSig(service, params.SourceChainID, crossChainMsg, headers); err != nil {
 		return nil, fmt.Errorf("neo MakeDepositProposal, VerifyCrossChainMsg error: %v", err)
 	}
 	// Verify the validity of proof with the help of state root in verified neo cross chain msg

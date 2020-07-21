@@ -18,6 +18,7 @@
 package neo
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"github.com/joeqian10/neo-gogogo/tx"
@@ -28,17 +29,11 @@ import (
 	"github.com/polynetwork/poly/native/service/utils"
 )
 
-//verify header of any height
-//find key height and get neoconsensus first, then check the witness
-func verifyHeader(native *native.NativeService, chainID uint64, header *NeoBlockHeader) error {
-	neoConsensus, err := getConsensusValByChainId(native, chainID)
-	if err != nil {
-		return fmt.Errorf("verifyHeader, get Consensus error:%s", err)
-	}
+//verify header using NeoConsensus.NextConsensus
+func verifyHeader(header *NeoBlockHeader, neoConsensus *NeoConsensus) error {
 	if neoConsensus.NextConsensus != header.Witness.GetScriptHash() {
 		return fmt.Errorf("verifyHeader, invalid script hash in header error, expected:%s, got:%s", neoConsensus.NextConsensus.String(), header.Witness.GetScriptHash().String())
 	}
-
 	msg, err := header.GetMessage()
 	if err != nil {
 		return fmt.Errorf("verifyHeader, unable to get hash data of header")
@@ -49,11 +44,35 @@ func verifyHeader(native *native.NativeService, chainID uint64, header *NeoBlock
 	return nil
 }
 
-func VerifyCrossChainMsgSig(native *native.NativeService, chainID uint64, crossChainMsg *NeoCrossChainMsg) error {
+func VerifyCrossChainMsgSig(native *native.NativeService, chainID uint64, crossChainMsg *NeoCrossChainMsg, headers [][]byte) error {
+	if len(headers) > 0 {
+		// Check if any header of headers contains switching consensus info, if so update the Consensus Validator.
+		// Then save crossChainMsg hash to recognize the same msg for other txs if msg.Index is the height containing switching validator info
+		return processHeadersAndMsg(native, chainID, headers, crossChainMsg)
+	}
 	neoConsensus, err := getConsensusValByChainId(native, chainID)
 	if err != nil {
-		return fmt.Errorf("verifyCrossChainMsg, get ConsensusPeer error:%v", err)
+		return fmt.Errorf("ProcessHeadersAndMsg, the consensus validator has not been initialized, chainId: %d", chainID)
 	}
+	return verifyCrossChainMsg(native, crossChainMsg, neoConsensus)
+}
+
+func verifyCrossChainMsg(native *native.NativeService, crossChainMsg *NeoCrossChainMsg, neoConsensus *NeoConsensus) error {
+	if err := verifyCrossChainMsgSig(crossChainMsg, neoConsensus); err != nil {
+		msgBs, err := crossChainMsg.GetMessage()
+		if err != nil {
+			return fmt.Errorf("verifyCrossChainMsg, msg.GetMessage() error: %v", err)
+		}
+		msgHash, err := getMsgHash(native, neoConsensus.ChainID)
+		if err == nil && msgHash == sha256.Sum256(msgBs) {
+			return nil
+		}
+		return fmt.Errorf("verifyCrossChainMsg, verify failed")
+	}
+	return nil
+}
+
+func verifyCrossChainMsgSig(crossChainMsg *NeoCrossChainMsg, neoConsensus *NeoConsensus) error {
 	crossChainMsgConsensus, err := crossChainMsg.GetScriptHash()
 	if err != nil {
 		return fmt.Errorf("verifyCrossChainMsg, getScripthash error:%v", err)
@@ -62,6 +81,7 @@ func VerifyCrossChainMsgSig(native *native.NativeService, chainID uint64, crossC
 		return fmt.Errorf("verifyCrossChainMsg, invalid script hash in NeoCrossChainMsg error, expected:%s, got:%s", neoConsensus.NextConsensus.String(), crossChainMsgConsensus.String())
 	}
 	msg, err := crossChainMsg.GetMessage()
+
 	if err != nil {
 		return fmt.Errorf("verifyCrossChainMsg, unable to get unsigned message of neo crossChainMsg")
 	}
@@ -73,26 +93,6 @@ func VerifyCrossChainMsgSig(native *native.NativeService, chainID uint64, crossC
 	}
 	if verified := tx.VerifyMultiSignatureWitness(msg, witness); !verified {
 		return fmt.Errorf("verifyCrossChainMsg, VerifyMultiSignatureWitness error:%s, height:%d", "verified failed", crossChainMsg.Index)
-	}
-	return nil
-}
-
-func UpdateConsensusPeer(native *native.NativeService, chainID uint64, header *NeoBlockHeader) error {
-	neoConsensus, err := getConsensusValByChainId(native, chainID)
-	if err != nil {
-		return fmt.Errorf("getNextConsensusByHeight error:%s", err)
-	}
-	if neoConsensus.NextConsensus != header.NextConsensus {
-		neoConsensus := &NeoConsensus{
-			ChainID:       chainID,
-			Height:        header.Index,
-			NextConsensus: header.NextConsensus,
-		}
-
-		err := putConsensusValByChainId(native, neoConsensus)
-		if err != nil {
-			return fmt.Errorf("updateConsensusPeer, putNextConsensusByHeight eerror: %s", err)
-		}
 	}
 	return nil
 }
@@ -125,4 +125,29 @@ func putConsensusValByChainId(native *native.NativeService, neoConsensus *NeoCon
 	chainIDBytes := utils.GetUint64Bytes(neoConsensus.ChainID)
 	native.GetCacheDB().Put(utils.ConcatKey(contract, []byte(hscommon.CONSENSUS_PEER), chainIDBytes), cstates.GenRawStorageItem(sink.Bytes()))
 	return nil
+}
+
+func putMsgHash(native *native.NativeService, chainID uint64, msgHash common.Uint256) error {
+	contract := utils.HeaderSyncContractAddress
+	chainIDBytes := utils.GetUint64Bytes(chainID)
+	native.GetCacheDB().Put(utils.ConcatKey(contract, []byte(hscommon.KEY_HASH), chainIDBytes),
+		cstates.GenRawStorageItem(msgHash.ToArray()))
+	return nil
+}
+
+func getMsgHash(native *native.NativeService, chainID uint64) (common.Uint256, error) {
+	contract := utils.HeaderSyncContractAddress
+	chainIDBytes := utils.GetUint64Bytes(chainID)
+	msgHashStore, err := native.GetCacheDB().Get(utils.ConcatKey(contract, []byte(hscommon.KEY_HASH), chainIDBytes))
+	if err != nil {
+		return common.UINT256_EMPTY, fmt.Errorf("getMsgHash, error: %v", err)
+	}
+	if msgHashStore == nil {
+		return common.UINT256_EMPTY, fmt.Errorf("getMsgHash, can not find any record")
+	}
+	msgHashBs, err := cstates.GetValueFromRawStorageItem(msgHashStore)
+	if err != nil {
+		return common.UINT256_EMPTY, fmt.Errorf("getConsensusPeerByHeight, deserialize from raw storage item err:%v", err)
+	}
+	return common.Uint256ParseFromBytes(msgHashBs)
 }

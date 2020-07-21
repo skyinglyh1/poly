@@ -40,7 +40,8 @@ const (
 	GENESIS_HEADER              = "genesisHeader"
 	MAIN_CHAIN                  = "mainChain"
 	EPOCH_SWITCH                = "epochSwitch"
-	SYNC_HEADER_NAME            = "syncHeader"
+	SYNC_HEADER_NAME            = "syncHeader" // used as keyword in sync header notify state
+	KEY_HASH                    = "keyHash"    // used to as key to store the key hash, say cross chain msg hash for neo
 )
 
 type HeaderSyncHandler interface {
